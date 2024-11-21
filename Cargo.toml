@@ -1,0 +1,16 @@
+
+[package]
+name = "windows-hardening"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+windows = { version = "0.48", features = ["Win32_System_Registry", "Win32_Foundation", "Win32_Security"] }
+log = "0.4"
+env_logger = "0.10"
+chrono = "0.4"
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+winreg = "0.50"
+windows-service = "0.5"

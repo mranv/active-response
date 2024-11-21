@@ -1,7 +1,7 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{self, Write},
-    path::{Path, PathBuf},
+    path::PathBuf,
     process::Command,
     thread,
     time::Duration,
@@ -14,6 +14,13 @@ use winreg::{
     enums::{HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS},
     RegKey,
 };
+
+#[derive(Debug)]
+enum RegistryValueType {
+    DWord(u32),
+    String(String),
+}
+
 
 #[derive(Debug)]
 struct HardeningConfig {
@@ -168,37 +175,123 @@ impl SystemHardening {
         Ok(())
     }
 
-    fn apply_registry_settings(&self) -> Result<()> {
-        info!("Applying registry hardening settings");
 
-        // Define all registry settings
-        let registry_settings = [
-            // Windows Defender settings
-            (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "26190899-1602-49E8-8B27-eB1D0A1CE869", 1u32),
-            (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "3B576869-A4EC-4529-8536-B80A7769E899", 1u32),
-            // Screen saver settings
-            (r"Software\Policies\Microsoft\Windows\Control Panel\Desktop", "ScreenSaverIsSecure", 1u32),
-            (r"Software\Policies\Microsoft\Windows\Control Panel\Desktop", "ScreenSaveActive", 1u32),
-            // Network settings
-            (r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters", "DisableIPSourceRouting", 2u32),
-            // ... Add all other registry settings from the PowerShell script
-        ];
+fn apply_registry_settings(&self) -> Result<()> {
+    info!("Applying registry hardening settings");
 
-        let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    // Define registry settings with proper value types
+    let registry_settings: Vec<(&str, &str, RegistryValueType)> = vec![
+        // Windows Defender ASR Rules
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "26190899-1602-49E8-8B27-eB1D0A1CE869", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "3B576869-A4EC-4529-8536-B80A7769E899", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "5BEB7EFE-FD9A-4556-801D-275E5FFC04CC", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "75668C1F-73B5-4CF0-BB93-3ECF5CB7CC84", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "7674BA52-37EB-4A4F-A9A1-F0F9A1619A2C", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "92E97FA1-2EDF-4476-BDD6-9DD0B4DDDC7B", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "9E6C4E1F-7D60-472F-bA1A-A39EF669E4B2", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "B2B3F03D-6A65-4F7B-A9C7-1C7EF74A9BA4", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "BE9BA2D9-53EA-4CDC-84E5-9B1EEEE46550", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "D3E037E1-3EB8-44C8-A917-57927947596D", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "D4F940AB-401B-4EFC-AADC-AD5F3C50688A", RegistryValueType::DWord(1)),
 
-        for (path, name, value) in registry_settings.iter() {
-            match hklm.create_subkey_with_flags(path, KEY_ALL_ACCESS) {
-                Ok((key, _)) => {
-                    if let Err(e) = key.set_value(name, value) {
-                        warn!("Failed to set registry value {}/{}: {}", path, name, e);
+        // Screen Saver Settings
+        (r"Software\Policies\Microsoft\Windows\Control Panel\Desktop", "ScreenSaverIsSecure", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows\Control Panel\Desktop", "ScreenSaveActive", RegistryValueType::DWord(1)),
+        
+        // Network Settings
+        (r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters", "DisableIPSourceRouting", RegistryValueType::DWord(2)),
+        (r"SYSTEM\CurrentControlSet\Services\SharedAccess", "Start", RegistryValueType::DWord(4)),
+        
+        // Network Provider Settings
+        (r"SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths", r"\\*\NETLOGON", 
+            RegistryValueType::String("RequireMutualAuthentication=1, RequireIntegrity=1".to_string())),
+        (r"SOFTWARE\Policies\Microsoft\Windows\NetworkProvider\HardenedPaths", r"\\*\SYSVOL", 
+            RegistryValueType::String("RequireMutualAuthentication=1, RequireIntegrity=1".to_string())),
+
+        // WCN Registrars
+        (r"SOFTWARE\Policies\Microsoft\Windows\WCN\Registrars", "DisableFlashConfigRegistrar", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Policies\Microsoft\Windows\WCN\Registrars", "DisableInBand802DOT11Registrar", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Policies\Microsoft\Windows\WCN\Registrars", "DisableUPnPRegistrar", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Policies\Microsoft\Windows\WCN\Registrars", "DisableWPDRegistrar", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Policies\Microsoft\Windows\WCN\Registrars", "EnableRegistrars", RegistryValueType::DWord(0)),
+
+        // System Policies
+        (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "DisableBkGndGroupPolicy", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System", "ProcessCreationIncludeCmdLine_Enabled", RegistryValueType::DWord(1)),
+
+        // Windows Error Reporting
+        (r"SOFTWARE\Policies\Microsoft\Windows\Windows Error Reporting", "Disabled", RegistryValueType::DWord(1)),
+
+        // PowerShell Settings
+        (r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging", "EnableScriptBlockLogging", RegistryValueType::DWord(1)),
+
+        // DNS Client Settings
+        (r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient", "DoHPolicy", RegistryValueType::DWord(2)),
+
+        // Printer Settings
+        (r"SOFTWARE\Policies\Microsoft\Windows NT\Printers", "RegisterSpoolerRemoteRpcEndPoint", RegistryValueType::DWord(2)),
+        (r"SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint", "NoWarningNoElevationOnInstall", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Policies\Microsoft\Windows NT\Printers\PointAndPrint", "RestrictDriverInstallationToAdministrators", RegistryValueType::DWord(1)),
+
+        // Device Metadata
+        (r"SOFTWARE\Policies\Microsoft\Windows\Device Metadata", "PreventDeviceMetadataFromNetwork", RegistryValueType::DWord(1)),
+
+        // Windows Update Settings
+        (r"SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate", "ManagePreviewBuilds", RegistryValueType::DWord(0)),
+
+        // Sandbox Settings
+        (r"SOFTWARE\Policies\Microsoft\Windows\Sandbox", "AllowClipboardRedirection", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Policies\Microsoft\Windows\Sandbox", "AllowNetworking", RegistryValueType::DWord(0)),
+
+        // Windows Defender Real-time Protection
+        (r"Software\Policies\Microsoft\Windows Defender\Real-Time Protection", "DisableScriptScanning", RegistryValueType::DWord(0)),
+
+        // Winlogon Settings
+        (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "ScreenSaverGracePeriod", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "AllocateDASD", RegistryValueType::String("0".to_string())),
+        (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "SCRemoveOption", RegistryValueType::String("1".to_string())),
+        (r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon", "AutoAdminLogon", RegistryValueType::String("0".to_string())),
+
+        // Additional Settings
+        (r"Software\Policies\Microsoft\Windows\CloudContent", "DisableConsumerAccountStateContent", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows\CloudContent", "DisableThirdPartySuggestions", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows\DataCollection", "DisableOneSettingsDownloads", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows\DataCollection", "EnableOneSettingsAuditing", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows\DataCollection", "LimitDiagnosticLogCollection", RegistryValueType::DWord(1)),
+        (r"Software\Policies\Microsoft\Windows\DataCollection", "LimitDumpCollection", RegistryValueType::DWord(1)),
+        (r"SOFTWARE\Microsoft\WcmSvc\wifinetworkmanager\config", "AutoConnectAllowedOEM", RegistryValueType::DWord(0)),
+        (r"Software\Policies\Microsoft\Windows\Installer", "AlwaysInstallElevated", RegistryValueType::DWord(0)),
+        (r"SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer", "NoInPlaceSharing", RegistryValueType::DWord(1)),
+        (r"SYSTEM\CurrentControlSet\Services\LanmanServer\Parameters", "NullSessionPipes", 
+            RegistryValueType::String("netlogon,samr,lsarpc".to_string())),
+    ];
+
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+
+    for (path, name, value) in registry_settings.iter() {
+        info!("Setting registry key: {}\\{}", path, name);
+        match hklm.create_subkey_with_flags(path, KEY_ALL_ACCESS) {
+            Ok((key, _)) => {
+                let result = match value {
+                    RegistryValueType::DWord(dword_value) => {
+                        key.set_value(name, dword_value)
+                    },
+                    RegistryValueType::String(string_value) => {
+                        key.set_value(name, string_value)
                     }
-                }
-                Err(e) => warn!("Failed to open/create registry key {}: {}", path, e),
-            }
-        }
+                };
 
-        Ok(())
+                if let Err(e) = result {
+                    warn!("Failed to set registry value {}/{}: {}", path, name, e);
+                }
+            }
+            Err(e) => warn!("Failed to open/create registry key {}: {}", path, e),
+        }
     }
+
+    info!("Registry settings applied successfully");
+    Ok(())
+}
 
     fn backup_registry(&self) -> Result<()> {
         info!("Backing up registry keys");

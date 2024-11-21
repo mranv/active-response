@@ -1,5 +1,3 @@
-
-
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -23,6 +21,7 @@ struct HardeningConfig {
     base_dir: PathBuf,
     backup_dir: PathBuf,
     logs_dir: PathBuf,
+    current_date: String,
 }
 
 impl HardeningConfig {
@@ -33,6 +32,7 @@ impl HardeningConfig {
             base_dir: base_dir.clone(),
             backup_dir: base_dir.join("Windows_Backup"),
             logs_dir: base_dir.join("Logs"),
+            current_date: Local::now().format("%Y/%m/%d").to_string(),
         }
     }
 
@@ -58,7 +58,8 @@ impl SystemHardening {
     fn init(&self) -> Result<()> {
         env_logger::init();
         self.config.ensure_directories()?;
-        self.write_log("Starting hardening process")?;
+        self.write_log("Starting")?;
+        self.start_transcript()?;
         Ok(())
     }
 
@@ -69,58 +70,93 @@ impl SystemHardening {
             timestamp, message
         );
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.config.log_path)
-            .context("Failed to open log file")?;
+        // Implement retry mechanism
+        let max_retries = 5;
+        let retry_wait = Duration::from_secs(1);
+        
+        for attempt in 0..max_retries {
+            match OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&self.config.log_path)
+            {
+                Ok(mut file) => {
+                    match file.write_all(log_entry.as_bytes()) {
+                        Ok(_) => return Ok(()),
+                        Err(e) => {
+                            if attempt == max_retries - 1 {
+                                return Err(e.into());
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    if attempt == max_retries - 1 {
+                        return Err(e.into());
+                    }
+                }
+            }
+            thread::sleep(retry_wait);
+        }
+        
+        Err(anyhow::anyhow!("Failed to write to log after maximum retries"))
+    }
 
-        file.write_all(log_entry.as_bytes())
-            .context("Failed to write to log file")?;
+    fn start_transcript(&self) -> Result<()> {
+        let transcript_path = self.config.logs_dir
+            .join(format!("Hardening-Apply-Process-{}.log", self.config.current_date));
+        
+        Command::new("powershell")
+            .args(&[
+                "-Command",
+                &format!("Start-Transcript -Path '{}'", transcript_path.display()),
+            ])
+            .output()
+            .context("Failed to start transcript")?;
+        
+        Ok(())
+    }
 
+    fn stop_transcript(&self) -> Result<()> {
+        Command::new("powershell")
+            .args(&["-Command", "Stop-Transcript"])
+            .output()
+            .context("Failed to stop transcript")?;
+        
         Ok(())
     }
 
     fn create_restore_point(&self) -> Result<()> {
         info!("Creating system restore point");
         
-        // PowerShell script content for creating restore point
         let ps_script = r#"
             # Enable System Restore if it's not already enabled
             Enable-ComputerRestore -Drive "C:\"
             
-            # Set the restore point creation frequency to 0 (no minimum interval)
-            Set-ItemProperty -Path "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\SystemRestore" -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord
+            # Set restore point creation frequency to 0
+            Set-ItemProperty -Path "HKLM:\Software\Microsoft\Windows NT\CurrentVersion\SystemRestore" `
+                -Name "SystemRestorePointCreationFrequency" -Value 0 -Type DWord
             
-            # Check for existing restore points with our description
+            # Check for existing restore points
             $existing = Get-ComputerRestorePoint | Where-Object { $_.Description -eq "Pre-Hardening Backup" }
             
             if (-not $existing) {
-                # Create the restore point
                 Checkpoint-Computer -Description "Pre-Hardening Backup" -RestorePointType "MODIFY_SETTINGS"
-                Write-Output "Restore point created successfully"
-            } else {
-                Write-Output "Restore point already exists"
             }
         "#;
 
-        // Create a temporary PowerShell script file
         let script_path = self.config.base_dir.join("create_restore_point.ps1");
         fs::write(&script_path, ps_script)?;
 
-        // Execute PowerShell script with elevated privileges
         let output = Command::new("powershell")
             .args(&[
-                "-ExecutionPolicy",
-                "Bypass",
+                "-ExecutionPolicy", "Bypass",
                 "-NoProfile",
-                "-File",
-                script_path.to_str().unwrap(),
+                "-File", script_path.to_str().unwrap(),
             ])
             .output()
             .context("Failed to execute PowerShell script")?;
 
-        // Clean up the temporary script
         fs::remove_file(script_path)?;
 
         if !output.status.success() {
@@ -129,25 +165,23 @@ impl SystemHardening {
             return Err(anyhow::anyhow!("Failed to create restore point"));
         }
 
-        info!("Restore point operation completed");
         Ok(())
     }
 
     fn apply_registry_settings(&self) -> Result<()> {
         info!("Applying registry hardening settings");
 
+        // Define all registry settings
         let registry_settings = [
-            (
-                r"SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging",
-                "EnableScriptBlockLogging",
-                1u32,
-            ),
-            (
-                r"SOFTWARE\Policies\Microsoft\Windows NT\DNSClient",
-                "DoHPolicy",
-                2u32,
-            ),
-            // Add your registry settings here
+            // Windows Defender settings
+            (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "26190899-1602-49E8-8B27-eB1D0A1CE869", 1u32),
+            (r"Software\Policies\Microsoft\Windows Defender\Windows Defender Exploit Guard\ASR\Rules", "3B576869-A4EC-4529-8536-B80A7769E899", 1u32),
+            // Screen saver settings
+            (r"Software\Policies\Microsoft\Windows\Control Panel\Desktop", "ScreenSaverIsSecure", 1u32),
+            (r"Software\Policies\Microsoft\Windows\Control Panel\Desktop", "ScreenSaveActive", 1u32),
+            // Network settings
+            (r"SYSTEM\CurrentControlSet\Services\Tcpip\Parameters", "DisableIPSourceRouting", 2u32),
+            // ... Add all other registry settings from the PowerShell script
         ];
 
         let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
@@ -190,36 +224,110 @@ impl SystemHardening {
             }
         }
 
+        // Export Group Policy
+        Command::new("gpresult")
+            .args(&["/h", &self.config.backup_dir.join("GroupPolicyBackup.html").to_string_lossy()])
+            .output()
+            .context("Failed to export Group Policy")?;
+
+        Ok(())
+    }
+
+    fn download_hardening_tools(&self) -> Result<()> {
+        info!("Downloading hardening tools");
+
+        // Download and extract hardening tools
+        let download_url = "https://github.com/bhaveshpa-icpl/Hardening-windows/archive/refs/heads/main.zip";
+        let zip_path = self.config.base_dir.join("main.zip");
+        
+        Command::new("powershell")
+            .args(&[
+                "-Command",
+                &format!(
+                    "Invoke-WebRequest -Uri '{}' -OutFile '{}'",
+                    download_url,
+                    zip_path.display()
+                ),
+            ])
+            .output()
+            .context("Failed to download hardening tools")?;
+
+        // Extract zip file
+        Command::new("powershell")
+            .args(&[
+                "-Command",
+                &format!(
+                    "Expand-Archive -Path '{}' -DestinationPath '{}'",
+                    zip_path.display(),
+                    self.config.base_dir.join("main").display()
+                ),
+            ])
+            .output()
+            .context("Failed to extract hardening tools")?;
+
         Ok(())
     }
 
     fn manage_services(&self) -> Result<()> {
-        info!("Managing services");
+        info!("Managing Wazuh service");
 
-        // Using Command to manage services
-        let services = ["WazuhSvc"]; // Add more services as needed
+        // Stop Wazuh service
+        Command::new("net")
+            .args(&["stop", "WazuhSvc"])
+            .output()
+            .context("Failed to stop Wazuh service")?;
 
-        for service in services.iter() {
-            // Stop service
-            let stop_output = Command::new("net")
-                .args(&["stop", service])
-                .output()
-                .with_context(|| format!("Failed to stop service: {}", service))?;
+        thread::sleep(Duration::from_secs(5));
 
-            if !stop_output.status.success() {
-                warn!("Failed to stop service: {}", service);
-            }
+        // Start Wazuh service
+        Command::new("net")
+            .args(&["start", "WazuhSvc"])
+            .output()
+            .context("Failed to start Wazuh service")?;
 
-            thread::sleep(Duration::from_secs(5));
+        // Verify service status
+        let status = Command::new("powershell")
+            .args(&[
+                "-Command",
+                "(Get-Service -Name 'WazuhSvc').Status",
+            ])
+            .output()
+            .context("Failed to get service status")?;
 
-            // Start service
-            let start_output = Command::new("net")
-                .args(&["start", service])
-                .output()
-                .with_context(|| format!("Failed to start service: {}", service))?;
+        let status_str = String::from_utf8_lossy(&status.stdout).trim().to_string();
+        if status_str != "Running" {
+            warn!("Wazuh service is not running. Current status: {}", status_str);
+        }
 
-            if !start_output.status.success() {
-                warn!("Failed to start service: {}", service);
+        Ok(())
+    }
+
+    fn cleanup(&self) -> Result<()> {
+        info!("Cleaning up temporary files");
+
+        // Remove temporary files
+        if let Ok(_) = fs::remove_file(self.config.base_dir.join("main.zip")) {
+            info!("Removed main.zip");
+        }
+        
+        if let Ok(_) = fs::remove_dir_all(self.config.base_dir.join("main")) {
+            info!("Removed main directory");
+        }
+
+        // Move log files
+        let log_pattern = "hardeningkitty_*";
+        for entry in fs::read_dir(".")? {
+            if let Ok(entry) = entry {
+                let path = entry.path();
+                if path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(log_pattern))
+                    .unwrap_or(false)
+                {
+                    if let Err(e) = fs::rename(&path, self.config.logs_dir.join(path.file_name().unwrap())) {
+                        warn!("Failed to move log file: {}", e);
+                    }
+                }
             }
         }
 
@@ -241,9 +349,19 @@ impl SystemHardening {
             warn!("Failed to backup registry: {}", e);
         }
 
+        // Download and extract hardening tools
+        if let Err(e) = self.download_hardening_tools() {
+            error!("Failed to download hardening tools: {}", e);
+        }
+
         // Apply registry settings
         if let Err(e) = self.apply_registry_settings() {
             error!("Failed to apply registry settings: {}", e);
+        }
+
+        // Cleanup
+        if let Err(e) = self.cleanup() {
+            warn!("Failed to cleanup: {}", e);
         }
 
         // Manage services
@@ -251,7 +369,8 @@ impl SystemHardening {
             warn!("Failed to manage services: {}", e);
         }
 
-        self.write_log("Hardening process completed")?;
+        self.stop_transcript()?;
+        self.write_log("Ended")?;
         info!("System hardening completed successfully");
 
         Ok(())
